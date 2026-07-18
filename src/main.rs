@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "dd-ng", about = "Parallel dd over multiple SSH TCP flows")]
+#[command(name = "dd-ng", version, about = "Parallel dd over multiple SSH TCP flows")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -43,10 +43,8 @@ enum Cmd {
         /// (ControlMaster=no, ControlPath=none, Compression=no, keepalives).
         #[arg(long)]
         no_ssh_defaults: bool,
-        /// Quiet: suppress live progress output.
-        #[arg(short = 'q', long)]
-        quiet: bool,
-        /// Verbose: -v shows ssh commands, -vv also shows control-channel messages.
+        /// Verbose: default is silent; -v shows progress + summary lines,
+        /// -vv also shows ssh commands, -vvv also shows control-channel messages.
         #[arg(short = 'v', long, action = clap::ArgAction::Count)]
         verbose: u8,
         /// fsync the output on the receiver before ack. Slower but durable.
@@ -57,6 +55,10 @@ enum Cmd {
         /// fsync drain on large writes to block devices.
         #[arg(long)]
         direct: bool,
+        /// Collect and print per-stage telemetry (src read / net / dst write).
+        /// Adds a busy% + queue-depth summary to progress, plus a final table.
+        #[arg(long)]
+        stats: bool,
     },
     /// Receiver control role (invoked over SSH by the sender).
     RecvCtrl,
@@ -82,10 +84,10 @@ fn main() -> Result<()> {
             ssh_opt,
             stream_delay_ms,
             no_ssh_defaults,
-            quiet,
             verbose,
             sync,
             direct,
+            stats,
         } => send::run(send::SendOpts {
             input,
             remote,
@@ -96,10 +98,10 @@ fn main() -> Result<()> {
             extra_ssh: ssh_opt,
             stream_delay_ms,
             no_ssh_defaults,
-            progress_ms: if quiet { 0 } else { 500 },
             sync,
             verbose,
             direct,
+            stats,
         }),
         Cmd::RecvCtrl => recv::run_ctrl(),
         Cmd::RecvData { token, id } => recv::run_data(&token, id),

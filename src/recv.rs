@@ -1,5 +1,6 @@
 use crate::proto::{
-    decode_frame_hdr, CtrlMsg, Manifest, Mode, Range, RvMsg, FRAME_HDR_LEN, MAGIC,
+    decode_frame_hdr, CtrlMsg, Manifest, Mode, Range, RecvStreamStats, RvMsg, FRAME_HDR_LEN, MAGIC,
+    STARVE_THRESHOLD,
 };
 use crate::util::{read_line, rendezvous_socket_path, write_line};
 use anyhow::{anyhow, bail, Context, Result};
@@ -10,6 +11,31 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
+
+#[derive(Default, Debug, Clone, Copy)]
+struct RecvIoStats {
+    net_recv_ns: u64,
+    dst_write_ns: u64,
+    read_starved_ns: u64,
+    read_calls: u64,
+    read_short_calls: u64,
+}
+impl RecvIoStats {
+    /// Record a completed read() call.
+    #[inline]
+    fn record_read(&mut self, dur_ns: u64, returned: usize) {
+        self.net_recv_ns += dur_ns;
+        self.read_calls += 1;
+        if returned > 0 && returned < STARVE_THRESHOLD {
+            self.read_starved_ns += dur_ns;
+            self.read_short_calls += 1;
+        }
+    }
+    #[inline]
+    fn record_write(&mut self, dur_ns: u64) {
+        self.dst_write_ns += dur_ns;
+    }
+}
 
 // ---------------- CTRL role ----------------
 
@@ -132,15 +158,42 @@ pub fn run_ctrl() -> Result<()> {
     let mut recv_crcs: HashMap<u32, u32> = HashMap::new();
     let mut recv_bytes: HashMap<u32, u64> = HashMap::new();
     let mut total_bytes = 0u64;
+    let mut per_stream_stats: Vec<RecvStreamStats> = Vec::with_capacity(n as usize);
+    let mut sum_net_recv_ns: u64 = 0;
+    let mut sum_dst_write_ns: u64 = 0;
+    let mut sum_read_starved_ns: u64 = 0;
+    let mut sum_read_calls: u64 = 0;
+    let mut sum_read_short_calls: u64 = 0;
+    let mut max_wall_ns: u64 = 0;
 
     for peer in peers.into_iter() {
         let mut rd = BufReader::new(peer.try_clone()?);
         let msg: RvMsg = serde_json::from_str(&read_line(&mut rd)?)?;
         match msg {
-            RvMsg::Done { stream_id, bytes, crc } => {
+            RvMsg::Done {
+                stream_id, bytes, crc,
+                net_recv_ns, dst_write_ns, wall_ns,
+                read_starved_ns, read_calls, read_short_calls,
+            } => {
                 total_bytes += bytes;
                 recv_bytes.insert(stream_id, bytes);
                 recv_crcs.insert(stream_id, crc);
+                sum_net_recv_ns += net_recv_ns;
+                sum_dst_write_ns += dst_write_ns;
+                sum_read_starved_ns += read_starved_ns;
+                sum_read_calls += read_calls;
+                sum_read_short_calls += read_short_calls;
+                if wall_ns > max_wall_ns { max_wall_ns = wall_ns; }
+                per_stream_stats.push(RecvStreamStats {
+                    stream_id,
+                    bytes,
+                    net_recv_ns,
+                    dst_write_ns,
+                    wall_ns,
+                    read_starved_ns,
+                    read_calls,
+                    read_short_calls,
+                });
                 if manifest.mode == Mode::Range {
                     let expected = assignments.get(&stream_id).unwrap().length;
                     if bytes != expected {
@@ -234,6 +287,18 @@ pub fn run_ctrl() -> Result<()> {
 
     write_line(
         &mut stdout,
+        &serde_json::to_string(&CtrlMsg::RecvStats {
+            net_recv_ns: sum_net_recv_ns,
+            dst_write_ns: sum_dst_write_ns,
+            read_starved_ns: sum_read_starved_ns,
+            read_calls: sum_read_calls,
+            read_short_calls: sum_read_short_calls,
+            wall_ns: max_wall_ns,
+            per_stream: per_stream_stats,
+        })?,
+    )?;
+    write_line(
+        &mut stdout,
         &serde_json::to_string(&CtrlMsg::Done { bytes: total_bytes })?,
     )?;
     Ok(())
@@ -269,15 +334,26 @@ pub fn run_data(token: &str, id: u32) -> Result<()> {
     let mut rd = BufReader::new(stream.try_clone()?);
     let assign: RvMsg = serde_json::from_str(&read_line(&mut rd)?)?;
 
+    let wall_t0 = std::time::Instant::now();
+    let mut io = RecvIoStats::default();
+
     let (written, crc) = match assign {
         RvMsg::AssignRange {
             output_path,
             offset,
             length,
             direct,
-        } => run_data_range(&mut stream, id, &output_path, offset, length, direct)?,
+        } => run_data_range(
+            &mut stream,
+            id,
+            &output_path,
+            offset,
+            length,
+            direct,
+            &mut io,
+        )?,
         RvMsg::AssignFramed { output_path } => {
-            run_data_framed(&mut stream, id, &output_path)?
+            run_data_framed(&mut stream, id, &output_path, &mut io)?
         }
         other => bail!("expected Assign*, got {other:?}"),
     };
@@ -288,6 +364,12 @@ pub fn run_data(token: &str, id: u32) -> Result<()> {
             stream_id: id,
             bytes: written,
             crc,
+            net_recv_ns: io.net_recv_ns,
+            dst_write_ns: io.dst_write_ns,
+            wall_ns: wall_t0.elapsed().as_nanos() as u64,
+            read_starved_ns: io.read_starved_ns,
+            read_calls: io.read_calls,
+            read_short_calls: io.read_short_calls,
         })?,
     )?;
     Ok(())
@@ -300,6 +382,7 @@ fn run_data_range(
     offset: u64,
     length: u64,
     direct: bool,
+    io: &mut RecvIoStats,
 ) -> Result<(u64, u32)> {
     const ALIGN: usize = 4096;
     let mut oo = OpenOptions::new();
@@ -322,10 +405,18 @@ fn run_data_range(
     } else {
         AlignedBuf::heap(bufsize)
     };
+    // Under O_DIRECT, only write the aligned prefix here; the unaligned tail
+    // (if any) is handled below via a second, buffered fd.
+    let aligned_len = if direct {
+        length - (length % ALIGN as u64)
+    } else {
+        length
+    };
+    let tail_len = length - aligned_len;
     let mut written = 0u64;
     let mut crc = 0u32;
-    while written < length {
-        let want = std::cmp::min(buf.len() as u64, length - written) as usize;
+    while written < aligned_len {
+        let want = std::cmp::min(buf.len() as u64, aligned_len - written) as usize;
         // In O_DIRECT mode we must read a *full* aligned chunk from stdin
         // before pwriting; short reads would leave us with an unaligned length.
         let target = if direct {
@@ -335,9 +426,18 @@ fn run_data_range(
         };
         let mut filled = 0;
         while filled < target {
-            match lock.read(&mut buf.as_mut_slice()[filled..target]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
+            let t0 = std::time::Instant::now();
+            let r = lock.read(&mut buf.as_mut_slice()[filled..target]);
+            let dt = t0.elapsed().as_nanos() as u64;
+            match r {
+                Ok(0) => {
+                    io.record_read(dt, 0);
+                    break;
+                }
+                Ok(n) => {
+                    io.record_read(dt, n);
+                    filled += n;
+                }
                 Err(e) => {
                     let _ = report_failed(stream, id, format!("stdin read: {e}"));
                     return Err(e.into());
@@ -357,11 +457,64 @@ fn run_data_range(
             let _ = report_failed(stream, id, reason.clone());
             bail!(reason);
         }
+        let tw = std::time::Instant::now();
         out.write_all_at(&buf.as_slice()[..filled], offset + written)
             .with_context(|| format!("pwrite @{}", offset + written))?;
+        io.record_write(tw.elapsed().as_nanos() as u64);
         crc = crc32c::crc32c_append(crc, &buf.as_slice()[..filled]);
         written += filled as u64;
     }
+    if written != aligned_len {
+        let reason = format!("short input: got {written}, expected {aligned_len}");
+        let _ = report_failed(stream, id, reason.clone());
+        bail!(reason);
+    }
+    drop(out);
+
+    // Handle unaligned tail under O_DIRECT by reopening without O_DIRECT.
+    if direct && tail_len > 0 {
+        let tail_out = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("reopen output (buffered tail) {path}"))?;
+        let mut tail_buf = vec![0u8; tail_len as usize];
+        let mut filled = 0usize;
+        while filled < tail_buf.len() {
+            let t0 = std::time::Instant::now();
+            let r = lock.read(&mut tail_buf[filled..]);
+            let dt = t0.elapsed().as_nanos() as u64;
+            match r {
+                Ok(0) => {
+                    io.record_read(dt, 0);
+                    break;
+                }
+                Ok(n) => {
+                    io.record_read(dt, n);
+                    filled += n;
+                }
+                Err(e) => {
+                    let _ = report_failed(stream, id, format!("stdin read (tail): {e}"));
+                    return Err(e.into());
+                }
+            }
+        }
+        if filled != tail_buf.len() {
+            let reason = format!(
+                "short input on tail: got {filled}, expected {} (stream {id})",
+                tail_buf.len()
+            );
+            let _ = report_failed(stream, id, reason.clone());
+            bail!(reason);
+        }
+        let tw = std::time::Instant::now();
+        tail_out
+            .write_all_at(&tail_buf, offset + written)
+            .with_context(|| format!("pwrite tail @{}", offset + written))?;
+        io.record_write(tw.elapsed().as_nanos() as u64);
+        crc = crc32c::crc32c_append(crc, &tail_buf);
+        written += tail_len;
+    }
+
     if written != length {
         let reason = format!("short input: got {written}, expected {length}");
         let _ = report_failed(stream, id, reason.clone());
@@ -426,6 +579,7 @@ fn run_data_framed(
     stream: &mut UnixStream,
     id: u32,
     path: &str,
+    io: &mut RecvIoStats,
 ) -> Result<(u64, u32)> {
     let out = OpenOptions::new()
         .write(true)
@@ -440,7 +594,11 @@ fn run_data_framed(
         // Try to read a header; EOF at start of a frame => done.
         let mut got = 0;
         while got < FRAME_HDR_LEN {
-            match lock.read(&mut hdr[got..])? {
+            let t0 = std::time::Instant::now();
+            let r = lock.read(&mut hdr[got..])?;
+            let dt = t0.elapsed().as_nanos() as u64;
+            io.record_read(dt, r);
+            match r {
                 0 => break,
                 n => got += n,
             }
@@ -455,8 +613,18 @@ fn run_data_framed(
         }
         let (offset, length, want_crc) = decode_frame_hdr(&hdr);
         let mut buf = vec![0u8; length as usize];
-        lock.read_exact(&mut buf)
-            .context("read frame payload")?;
+        // Read payload in a loop so we can classify each read().
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let t0 = std::time::Instant::now();
+            let r = lock.read(&mut buf[filled..])?;
+            let dt = t0.elapsed().as_nanos() as u64;
+            io.record_read(dt, r);
+            if r == 0 {
+                bail!("short frame payload: got {filled}/{}", buf.len());
+            }
+            filled += r;
+        }
         let got_crc = crc32c::crc32c(&buf);
         if got_crc != want_crc {
             let reason = format!(
@@ -466,8 +634,10 @@ fn run_data_framed(
             let _ = report_failed(stream, id, reason.clone());
             bail!(reason);
         }
+        let tw = std::time::Instant::now();
         out.write_all_at(&buf, offset)
             .with_context(|| format!("pwrite @{offset}"))?;
+        io.record_write(tw.elapsed().as_nanos() as u64);
         written += length as u64;
     }
     Ok((written, 0))

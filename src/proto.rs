@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 
 pub const MAGIC: &str = "DDNG1";
 
+/// A read() that returns fewer than this many bytes is classified as "starved":
+/// the kernel gave us whatever was available on the socket and we blocked
+/// waiting for more. Used as a proxy signal for network/sender bottleneck on
+/// the receiver.
+pub const STARVE_THRESHOLD: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Mode {
     /// Seekable input, known size, fixed byte range per stream, no framing.
@@ -58,9 +64,44 @@ pub enum CtrlMsg {
     Done {
         bytes: u64,
     },
+    /// Optional per-receiver telemetry, sent right before Done.
+    /// Additive & backward-compatible: older senders/receivers just skip it.
+    RecvStats {
+        /// Sum across all data streams (nanoseconds).
+        net_recv_ns: u64,
+        dst_write_ns: u64,
+        /// Portion of net_recv_ns spent in read() calls that returned "short"
+        /// (< STARVE_THRESHOLD bytes) — a proxy for network/sender starvation.
+        #[serde(default)]
+        read_starved_ns: u64,
+        #[serde(default)]
+        read_calls: u64,
+        #[serde(default)]
+        read_short_calls: u64,
+        /// Wall-clock time from first Hello to last Done on the receiver.
+        wall_ns: u64,
+        /// Per-stream breakdown (index = stream_id).
+        #[serde(default)]
+        per_stream: Vec<RecvStreamStats>,
+    },
     Abort {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecvStreamStats {
+    pub stream_id: u32,
+    pub bytes: u64,
+    pub net_recv_ns: u64,
+    pub dst_write_ns: u64,
+    pub wall_ns: u64,
+    #[serde(default)]
+    pub read_starved_ns: u64,
+    #[serde(default)]
+    pub read_calls: u64,
+    #[serde(default)]
+    pub read_short_calls: u64,
 }
 
 /// Messages on the local unix rendezvous socket (ctrl <-> data procs).
@@ -87,6 +128,18 @@ pub enum RvMsg {
         bytes: u64,
         /// CRC32C of bytes actually written (payload order in framed mode).
         crc: u32,
+        #[serde(default)]
+        net_recv_ns: u64,
+        #[serde(default)]
+        dst_write_ns: u64,
+        #[serde(default)]
+        wall_ns: u64,
+        #[serde(default)]
+        read_starved_ns: u64,
+        #[serde(default)]
+        read_calls: u64,
+        #[serde(default)]
+        read_short_calls: u64,
     },
     Failed {
         stream_id: u32,
