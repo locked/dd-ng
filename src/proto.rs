@@ -39,6 +39,11 @@ pub struct Manifest {
     /// Range mode only; requires 4 KiB alignment of offsets, lengths, buffers.
     #[serde(default)]
     pub direct: bool,
+    /// If true, skip CRC32C verification (both per-stream in Range mode and
+    /// per-frame in Framed mode). Reduces CPU cost; loses end-to-end integrity
+    /// check (TCP still checksums individual segments).
+    #[serde(default)]
+    pub no_crc: bool,
     /// Empty in Framed mode.
     pub ranges: Vec<Range>,
 }
@@ -118,10 +123,14 @@ pub enum RvMsg {
         length: u64,
         #[serde(default)]
         direct: bool,
+        #[serde(default)]
+        no_crc: bool,
     },
     /// Mode Framed assignment.
     AssignFramed {
         output_path: String,
+        #[serde(default)]
+        no_crc: bool,
     },
     Done {
         stream_id: u32,

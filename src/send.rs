@@ -27,6 +27,7 @@ pub struct SendOpts {
     pub sync: bool,
     pub verbose: u8,
     pub direct: bool,
+    pub no_crc: bool,
     pub stats: bool,
 }
 
@@ -342,6 +343,7 @@ pub fn run(opts: SendOpts) -> Result<()> {
         output_path: remote_path.clone(),
         sync: opts.sync,
         direct: opts.direct,
+        no_crc: opts.no_crc,
         ranges: ranges.clone(),
     };
 
@@ -603,6 +605,7 @@ fn run_mode_range(
         let input_path = input_path.clone();
         let progress = progress.clone();
         let stats = stats.cloned();
+        let no_crc = opts.no_crc;
 
         let h = thread::spawn(move || -> Result<(u64, u32)> {
             let wall_t0 = std::time::Instant::now();
@@ -621,6 +624,10 @@ fn run_mode_range(
             let mut written = 0u64;
             let mut crc = 0u32;
             let mut sink = child.stdin.take().unwrap();
+            {
+                use std::os::unix::io::AsRawFd;
+                let _ = crate::util::try_set_pipe_size(sink.as_raw_fd(), 1 << 20);
+            }
 
             let mut local_read_ns = 0u64;
             let mut local_write_ns = 0u64;
@@ -641,7 +648,9 @@ fn run_mode_range(
                 if n == 0 {
                     bail!("short read stream {id}");
                 }
-                crc = crc32c::crc32c_append(crc, &buf[..n]);
+                if !no_crc {
+                    crc = crc32c::crc32c_append(crc, &buf[..n]);
+                }
                 let t1 = std::time::Instant::now();
                 sink.write_all(&buf[..n]).map_err(|e| ssh_write_err(id, e))?;
                 let dt_write = t1.elapsed().as_nanos() as u64;
@@ -768,6 +777,7 @@ fn run_mode_framed(
         let id = i as u32;
         let progress = progress.clone();
         let stats = stats.cloned();
+        let no_crc = opts.no_crc;
 
         let h = thread::spawn(move || -> Result<u64> {
             let wall_t0 = std::time::Instant::now();
@@ -780,11 +790,15 @@ fn run_mode_framed(
                 .spawn()
                 .context("spawn ssh data")?;
             let mut sink = child.stdin.take().unwrap();
+            {
+                use std::os::unix::io::AsRawFd;
+                let _ = crate::util::try_set_pipe_size(sink.as_raw_fd(), 1 << 20);
+            }
             let mut sent = 0u64;
             let mut local_write_ns = 0u64;
 
             while let Some(chunk) = q.pop() {
-                let crc = crc32c::crc32c(&chunk.data);
+                let crc = if no_crc { 0 } else { crc32c::crc32c(&chunk.data) };
                 let hdr = encode_frame_hdr(chunk.offset, chunk.data.len() as u32, crc);
                 let t0 = std::time::Instant::now();
                 sink.write_all(&hdr).map_err(|e| ssh_write_err(id, e))?;
@@ -897,6 +911,7 @@ fn fmt_ns_rate(bytes: u64, ns: u64) -> String {
 struct RemoteStats {
     net_recv_ns: u64,
     dst_write_ns: u64,
+    #[allow(dead_code)]
     wall_ns: u64,
     per_stream: Vec<crate::proto::RecvStreamStats>,
     read_starved_ns: u64,

@@ -144,10 +144,12 @@ pub fn run_ctrl() -> Result<()> {
                     offset: r.offset,
                     length: r.length,
                     direct: manifest.direct,
+                    no_crc: manifest.no_crc,
                 }
             }
             Mode::Framed => RvMsg::AssignFramed {
                 output_path: manifest.output_path.clone(),
+                no_crc: manifest.no_crc,
             },
         };
         write_line(&mut stream, &serde_json::to_string(&assign)?)?;
@@ -312,6 +314,10 @@ fn abort<W: std::io::Write>(w: &mut W, reason: String) -> Result<()> {
 // ---------------- DATA role ----------------
 
 pub fn run_data(token: &str, id: u32) -> Result<()> {
+    // Best-effort: enlarge stdin pipe (ssh -> dd-ng recv-data) to reduce
+    // syscall count and prevent short reads on high-latency links.
+    let _ = crate::util::try_set_pipe_size(0, 1 << 20);
+
     let sock_path = rendezvous_socket_path(token);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut stream = loop {
@@ -343,6 +349,7 @@ pub fn run_data(token: &str, id: u32) -> Result<()> {
             offset,
             length,
             direct,
+            no_crc,
         } => run_data_range(
             &mut stream,
             id,
@@ -350,10 +357,11 @@ pub fn run_data(token: &str, id: u32) -> Result<()> {
             offset,
             length,
             direct,
+            no_crc,
             &mut io,
         )?,
-        RvMsg::AssignFramed { output_path } => {
-            run_data_framed(&mut stream, id, &output_path, &mut io)?
+        RvMsg::AssignFramed { output_path, no_crc } => {
+            run_data_framed(&mut stream, id, &output_path, no_crc, &mut io)?
         }
         other => bail!("expected Assign*, got {other:?}"),
     };
@@ -382,6 +390,7 @@ fn run_data_range(
     offset: u64,
     length: u64,
     direct: bool,
+    no_crc: bool,
     io: &mut RecvIoStats,
 ) -> Result<(u64, u32)> {
     const ALIGN: usize = 4096;
@@ -461,7 +470,9 @@ fn run_data_range(
         out.write_all_at(&buf.as_slice()[..filled], offset + written)
             .with_context(|| format!("pwrite @{}", offset + written))?;
         io.record_write(tw.elapsed().as_nanos() as u64);
-        crc = crc32c::crc32c_append(crc, &buf.as_slice()[..filled]);
+        if !no_crc {
+            crc = crc32c::crc32c_append(crc, &buf.as_slice()[..filled]);
+        }
         written += filled as u64;
     }
     if written != aligned_len {
@@ -511,7 +522,9 @@ fn run_data_range(
             .write_all_at(&tail_buf, offset + written)
             .with_context(|| format!("pwrite tail @{}", offset + written))?;
         io.record_write(tw.elapsed().as_nanos() as u64);
-        crc = crc32c::crc32c_append(crc, &tail_buf);
+        if !no_crc {
+            crc = crc32c::crc32c_append(crc, &tail_buf);
+        }
         written += tail_len;
     }
 
@@ -579,6 +592,7 @@ fn run_data_framed(
     stream: &mut UnixStream,
     id: u32,
     path: &str,
+    no_crc: bool,
     io: &mut RecvIoStats,
 ) -> Result<(u64, u32)> {
     let out = OpenOptions::new()
@@ -625,7 +639,7 @@ fn run_data_framed(
             }
             filled += r;
         }
-        let got_crc = crc32c::crc32c(&buf);
+        let got_crc = if no_crc { want_crc } else { crc32c::crc32c(&buf) };
         if got_crc != want_crc {
             let reason = format!(
                 "crc mismatch stream {id} @off {offset} len {length}: \

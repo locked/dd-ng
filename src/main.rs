@@ -24,8 +24,9 @@ enum Cmd {
         /// Number of parallel data streams.
         #[arg(short = 'n', long, default_value_t = 8)]
         streams: u32,
-        /// I/O block size in bytes.
-        #[arg(short = 'b', long, default_value_t = 4 << 20)]
+        /// I/O block size. Accepts unit suffixes: K, M, G, T (1024-based),
+        /// or explicit KiB/MiB/GiB. Default 4M.
+        #[arg(short = 'b', long, default_value = "4M", value_parser = parse_size_arg)]
         block_size: u64,
         /// Path to dd-ng on the remote host.
         #[arg(long, default_value = "dd-ng")]
@@ -55,6 +56,11 @@ enum Cmd {
         /// fsync drain on large writes to block devices.
         #[arg(long)]
         direct: bool,
+        /// Skip CRC32C verification (per-stream in Range mode, per-frame in
+        /// Framed mode). TCP still protects individual segments; use this to
+        /// isolate whether CRC computation is the bottleneck.
+        #[arg(long)]
+        no_crc: bool,
         /// Collect and print per-stage telemetry (src read / net / dst write).
         /// Adds a busy% + queue-depth summary to progress, plus a final table.
         #[arg(long)]
@@ -87,6 +93,7 @@ fn main() -> Result<()> {
             verbose,
             sync,
             direct,
+            no_crc,
             stats,
         } => send::run(send::SendOpts {
             input,
@@ -101,9 +108,14 @@ fn main() -> Result<()> {
             sync,
             verbose,
             direct,
+            no_crc,
             stats,
         }),
         Cmd::RecvCtrl => recv::run_ctrl(),
         Cmd::RecvData { token, id } => recv::run_data(&token, id),
     }
+}
+
+fn parse_size_arg(s: &str) -> Result<u64, String> {
+    util::parse_size(s).map_err(|e| e.to_string())
 }
